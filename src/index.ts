@@ -7,7 +7,6 @@ async function getCoinGeckoPrice(tokenId: string): Promise<{ price?: number; err
 	if (!tokenId || typeof tokenId !== 'string') {
 		return { error: 'Invalid or missing token_id parameter.' };
 	}
-
 	try {
 		const axiosInstance = axios.create({
 			baseURL: 'https://api.coingecko.com/api/v3',
@@ -35,9 +34,17 @@ async function getCoinGeckoPrice(tokenId: string): Promise<{ price?: number; err
 	}
 }
 
+
 // Create the HTTP server
 const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
 	const parsedUrl = parse(req.url || '', true); // true parses query string
+
+	// Add a basic root handler for health checks
+	if (parsedUrl.pathname === '/' && req.method === 'GET') {
+		res.writeHead(200, { 'Content-Type': 'text/plain' });
+		res.end('CoinGecko Price SSE Server OK');
+		return;
+	}
 
 	// Handle SSE requests on the /sse path
 	if (parsedUrl.pathname === '/sse' && req.method === 'GET') {
@@ -73,14 +80,15 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 	} else {
 		// Handle other paths or methods
 		res.writeHead(404, { 'Content-Type': 'text/plain' });
-		res.end('Not Found');
+		res.end('Not Found. Use GET /sse?token_id=... for price data.');
 	}
 });
 
 // Start the server
 const port = process.env.PORT || 3000; // Use environment variable for port or default to 3000
 server.listen(port, () => {
-	console.log(`CoinGecko Price SSE server running at http://localhost:${port}/sse`);
+	console.log(`CoinGecko Price SSE server running at http://localhost:${port}/`);
+	console.log(`SSE endpoint: http://localhost:${port}/sse`);
 	console.log(`Example usage: http://localhost:${port}/sse?token_id=bitcoin`);
 });
 
