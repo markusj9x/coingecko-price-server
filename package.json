@@ -18,8 +18,10 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^0.6.1",
+    "@types/express": "^5.0.1",
     "@types/ws": "^8.18.1",
     "axios": "^1.8.4",
+    "express": "^5.1.0",
     "ws": "^8.18.1"
   },
   "devDependencies": {

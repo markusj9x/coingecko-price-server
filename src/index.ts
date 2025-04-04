@@ -1,9 +1,8 @@
-import { createServer, IncomingMessage } from 'http';
+import express, { Request, Response } from 'express';
 import axios from 'axios';
-import { WebSocketServer, WebSocket } from 'ws';
+import http from 'http';
 
 // --- Define MCP Structures Manually (Based on JSON-RPC 2.0 and MCP conventions) ---
-// Basic JSON-RPC Request/Response structures
 interface JsonRpcRequest {
 	jsonrpc: '2.0';
 	method: string;
@@ -24,21 +23,18 @@ interface JsonRpcError {
 	data?: any;
 }
 
-// MCP Specific structures (simplified)
 interface McpToolDefinition {
 	name: string;
 	description?: string;
 	inputSchema?: object; // JSON Schema
 }
 
-// Define Error Codes manually if not importable
 enum McpErrorCode {
 	ParseError = -32700,
 	InvalidRequest = -32600,
 	MethodNotFound = -32601,
 	InvalidParams = -32602,
 	InternalError = -32603,
-	// Add other MCP-specific codes if needed
 }
 
 // --- CoinGecko Logic (same as before) ---
@@ -91,43 +87,61 @@ const coingeckoToolDefinition: McpToolDefinition = {
 	},
 };
 
-async function handleMcpRequest(request: JsonRpcRequest): Promise<JsonRpcResponse> {
+// Store the active SSE response stream (simple approach for single client)
+// For multiple clients, you'd need a map (e.g., using a session ID from POST /messages)
+let activeSseResponse: Response | null = null;
+let activeSseClientId: string | number | null = null; // Track ID for potential async responses
+
+// Function to send data over the active SSE connection
+function sendSseMessage(res: Response | null, id: string | number | null, eventName: string, data: any) {
+	if (res && !res.writableEnded) {
+		const payload = JSON.stringify(data);
+		console.log(`[SSE Send ${id}] Event: ${eventName}, Data: ${payload}`);
+		// Note: Sending request ID in SSE 'id' field might not be standard MCP,
+		// but helps correlate responses if needed. Standard SSE just uses 'id' for stream position.
+		res.write(`id: ${id || Date.now()}\n`);
+		res.write(`event: ${eventName}\n`);
+		res.write(`data: ${payload}\n\n`);
+	} else {
+		console.warn(`[SSE Send ${id}] Attempted to send message but no active/writable SSE connection.`);
+	}
+}
+
+// Function to send JSON-RPC responses via SSE
+function sendSseJsonResponse(res: Response | null, response: JsonRpcResponse) {
+	// According to MCP spec, responses/notifications are sent via the SSE stream
+	sendSseMessage(res, response.id, 'mcp_message', response); // Use a generic event like 'mcp_message'
+}
+
+
+async function handleMcpRequestViaPost(request: JsonRpcRequest): Promise<JsonRpcResponse> {
 	const { method, params, id } = request;
-	console.log(`[Manual Handler Request ${id}] Method: ${method}`);
+	console.log(`[Manual Handler POST ${id}] Method: ${method}`);
 
 	try {
-		// --- Route MCP Methods ---
 		if (method === 'listTools') {
 			return {
 				jsonrpc: '2.0',
 				id: id,
-				result: {
-					tools: [coingeckoToolDefinition],
-				},
+				result: { tools: [coingeckoToolDefinition] },
 			};
 		} else if (method === 'callTool') {
-			// Basic validation for callTool params
 			if (!params || typeof params !== 'object' || typeof params.name !== 'string') {
 				throw { code: McpErrorCode.InvalidParams, message: 'Invalid params for callTool' };
 			}
-
 			if (params.name === 'get_coingecko_price') {
 				if (!isValidPriceArgs(params.arguments)) {
 					throw { code: McpErrorCode.InvalidParams, message: 'Invalid arguments for get_coingecko_price: requires a "token_id" string.' };
 				}
 				const tokenId = params.arguments.token_id;
 				const result = await getCoinGeckoPrice(tokenId);
-
 				if (result.price !== undefined) {
 					return {
 						jsonrpc: '2.0',
 						id: id,
-						result: { // MCP CallToolResponse structure
-							content: [{ type: 'text', text: `The current price of ${tokenId} is $${result.price} USD.` }],
-						},
+						result: { content: [{ type: 'text', text: `The current price of ${tokenId} is $${result.price} USD.` }] },
 					};
 				} else {
-					// Application-level error, return as error in JSON-RPC response
 					throw { code: McpErrorCode.InternalError, message: result.error || 'Failed to get price.' };
 				}
 			} else {
@@ -138,7 +152,6 @@ async function handleMcpRequest(request: JsonRpcRequest): Promise<JsonRpcRespons
 		}
 	} catch (error: any) {
 		console.error(`[Manual Handler Error ${id}]`, error);
-		// Ensure error has code and message for JSON-RPC response
 		const code = typeof error.code === 'number' ? error.code : McpErrorCode.InternalError;
 		const message = typeof error.message === 'string' ? error.message : 'Internal Server Error';
 		return {
@@ -149,72 +162,102 @@ async function handleMcpRequest(request: JsonRpcRequest): Promise<JsonRpcRespons
 	}
 }
 
-// --- HTTP and WebSocket Server Setup ---
-const httpServer = createServer((req: IncomingMessage, res) => {
-	// Basic HTTP server - responds 404 to non-WebSocket upgrade requests
-	if (req.headers.upgrade !== 'websocket') {
-		res.writeHead(404, { 'Content-Type': 'text/plain' });
-		res.end('Not Found. Use WebSocket connection.');
-		return;
+// --- Express App Setup ---
+const app = express();
+app.use(express.json()); // Middleware to parse JSON POST bodies
+
+// 1. SSE Endpoint (GET /sse)
+app.get('/sse', async (req: Request, res: Response) => {
+	console.log('[Express] Received GET /sse request');
+	if (activeSseResponse) {
+		console.warn('[Express] Overwriting existing SSE connection. Server only supports one client currently.');
+		activeSseResponse.end(); // Close previous connection
+	}
+
+	// Set SSE headers
+	res.writeHead(200, {
+		'Content-Type': 'text/event-stream',
+		'Cache-Control': 'no-cache',
+		'Connection': 'keep-alive',
+		'Access-Control-Allow-Origin': '*', // Adjust for production
+	});
+
+	// Send a connection confirmation message (optional)
+	sendSseMessage(res, null, 'mcp_status', { status: 'connected' });
+
+	// Store the response object for sending messages later
+	activeSseResponse = res;
+	activeSseClientId = null; // Reset client ID for this connection
+
+	console.log('[Express] SSE connection established');
+
+	// Keep connection open - handle client disconnect
+	req.on('close', () => {
+		console.log('[Express] Client disconnected from /sse');
+		if (activeSseResponse === res) {
+			activeSseResponse = null; // Clear the active response stream
+			activeSseClientId = null;
+		}
+	});
+});
+
+// 2. Message Endpoint (POST /messages)
+app.post('/messages', async (req: Request, res: Response) => {
+	console.log('[Express] Received POST /messages request:', req.body);
+	let requestId: string | number | null = null;
+	try {
+		const request: JsonRpcRequest = req.body;
+		requestId = request.id; // Capture ID
+
+		// Basic validation
+		if (request.jsonrpc !== '2.0' || !request.method) {
+			throw { code: McpErrorCode.InvalidRequest, message: 'Invalid JSON-RPC request structure' };
+		}
+
+		// Process the request
+		const response = await handleMcpRequestViaPost(request);
+
+		// Send the response back via the active SSE stream
+		sendSseJsonResponse(activeSseResponse, response);
+
+		// Send a 202 Accepted response to the POST request itself
+		// (The actual result comes via SSE)
+		res.status(202).send({ status: 'Request received, response sent via SSE.' });
+
+	} catch (error: any) {
+		console.error(`[Express POST /messages Error ${requestId}]`, error);
+		const code = typeof error.code === 'number' ? error.code : McpErrorCode.InternalError;
+		const message = typeof error.message === 'string' ? error.message : 'Internal Server Error';
+		// Send error back to the POST request originator
+		res.status(500).json({
+			jsonrpc: '2.0',
+			id: requestId,
+			error: { code, message },
+		});
+		// Optionally also send error via SSE if a connection exists
+		if (activeSseResponse) {
+			sendSseJsonResponse(activeSseResponse, {
+				jsonrpc: '2.0',
+				id: requestId,
+				error: { code, message },
+			});
+		}
 	}
 });
 
-const wss = new WebSocketServer({ server: httpServer });
-
-wss.on('connection', (ws, req) => {
-	console.log('[WebSocketServer] Client connected.');
-
-	ws.on('message', async (data) => {
-		console.log('[WebSocketServer] Received message:', data.toString());
-		let requestId: string | number | null = null;
-		try {
-			const request: JsonRpcRequest = JSON.parse(data.toString());
-			requestId = request.id; // Capture ID early
-
-			// Basic validation
-			if (request.jsonrpc !== '2.0' || !request.method) {
-				throw { code: McpErrorCode.InvalidRequest, message: 'Invalid JSON-RPC request structure' };
-			}
-
-			// Handle the request manually
-			const response = await handleMcpRequest(request);
-
-			// Send the response back
-			if (ws.readyState === WebSocket.OPEN) {
-				console.log(`[WebSocketServer] Sending response ${response.id}:`, JSON.stringify(response));
-				ws.send(JSON.stringify(response));
-			}
-
-		} catch (error: any) {
-			console.error(`[WebSocketServer] Error processing message (request ID: ${requestId}):`, error);
-			// Send JSON-RPC error response
-			const code = typeof error.code === 'number' ? error.code : McpErrorCode.InternalError;
-			const message = typeof error.message === 'string' ? error.message : 'Internal Server Error';
-			const errorResponse: JsonRpcResponse = {
-				jsonrpc: '2.0',
-				id: requestId, // Use captured ID if available
-				error: { code, message },
-			};
-			if (ws.readyState === WebSocket.OPEN) {
-				ws.send(JSON.stringify(errorResponse));
-			}
-		}
-	});
-
-	ws.on('close', () => {
-		console.log('[WebSocketServer] Client disconnected.');
-	});
-
-	ws.on('error', (error) => {
-		console.error('[WebSocketServer] WebSocket connection error:', error);
-	});
+// Basic root handler
+app.get('/', (req, res) => {
+	res.status(200).send('CoinGecko Price MCP Server (Manual SSE Transport) is running. Connect via GET /sse and POST /messages.');
 });
 
-// Start the HTTP server (which hosts the WebSocket server)
+// --- Start Server ---
 const port = process.env.PORT || 3000;
+const httpServer = http.createServer(app);
+
 httpServer.listen(port, () => {
-	console.log(`CoinGecko Price MCP WebSocket server running on port ${port}`);
-	console.log(`Connect via WebSocket at ws://localhost:${port}`); // Or wss://your-render-url
+	console.log(`CoinGecko Price MCP SSE server running on port ${port}`);
+	console.log(`SSE Endpoint: http://localhost:${port}/sse`);
+	console.log(`Message Endpoint: http://localhost:${port}/messages`);
 });
 
 httpServer.on('error', (error) => {
@@ -223,10 +266,11 @@ httpServer.on('error', (error) => {
 
 process.on('SIGINT', () => {
 	console.log('Shutting down server...');
-	wss.close(() => {
-		httpServer.close(() => {
-			console.log('Server shut down.');
-			process.exit(0);
-		});
+	if (activeSseResponse) {
+		activeSseResponse.end(); // Close active SSE connection
+	}
+	httpServer.close(() => {
+		console.log('Server shut down.');
+		process.exit(0);
 	});
 });
